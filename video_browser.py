@@ -7,6 +7,7 @@
 ステップ5：動画の長さを裏で少しずつ調べて表示（調べた結果は保存）
 ステップ6：サムネイルタブ（今の一覧を画像で並べる＋選んだ1本を4枚で大きく見る）
 """
+import ctypes
 import json
 import os
 import subprocess
@@ -64,6 +65,9 @@ def load_settings():
 
 DEFAULT_GROUPS = ("出演者", "ジャンル", "シリーズ", "その他")
 FIXED_COLUMNS = ("play", "star")   # いつも左端に置く列（▶ 再生、☆ 星）。ドラッグで動かさない
+# 見出しを押して並べ替えられる列。最初に押したとき「大きい・新しい順」にする列
+SORT_COLUMNS = ("star", "name", "dur", "tags", "mtime", "size", "folder")
+SORT_DESC_FIRST = ("star", "dur", "mtime", "size")
 
 
 def normalize_favorites(data):
@@ -244,7 +248,11 @@ class ThumbView(ttk.Frame):
         self.canvas.configure(yscrollcommand=self.sb.set)
         self.canvas.pack(side="left", fill="both", expand=True)
         self.sb.pack(side="right", fill="y")
-        self.canvas.bind("<Configure>", lambda e: self.layout())
+        self.canvas.bind("<Configure>", self.on_configure)
+        self.layout_job = None
+        self.scroll_job = None
+        self.last_size = None
+        self.drawn = {}          # 並び順 → そのタイルの部品（見えている分だけ）
         self.canvas.bind("<MouseWheel>", self.on_wheel)
         self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<Double-1>", self.on_double)
@@ -316,7 +324,24 @@ class ThumbView(ttk.Frame):
         self.canvas.yview_moveto(0)
         self.layout()
 
+    def on_configure(self, e):
+        """窓の大きさを変えている間は何十回も来るので、手が止まってから 1 回だけ並べ直す"""
+        size = (e.width, e.height)
+        if size == self.last_size:
+            return
+        self.last_size = size
+        if self.layout_job:
+            self.after_cancel(self.layout_job)
+        self.layout_job = self.after(60, self.layout_when_released)
+
+    def layout_when_released(self):
+        if mouse_held():   # 窓のふちをつかんでいる間は待つ
+            self.layout_job = self.after(150, self.layout_when_released)
+        else:
+            self.layout()
+
     def layout(self):
+        self.layout_job = None
         w = max(self.canvas.winfo_width(), self.TILE_W)
         self.cols = max(1, w // self.TILE_W)
         rows = (len(self.items) + self.cols - 1) // self.cols
@@ -346,42 +371,71 @@ class ThumbView(ttk.Frame):
         return self.app.tabs.index("current") == 1
 
     def draw(self):
+        """見えている分を全部描き直す（選んだ・星・絵ができた など、中身が変わったとき）"""
         c = self.canvas
         c.delete("tile")
+        self.drawn = {}
         if not self.items:
             c.create_text(20, 20, anchor="nw", text="（動画がありません）", fill="#888", tags="tile")
             return
+        self.draw_scrolled()
+
+    def draw_scrolled(self):
+        """スクロールしたとき。もう描いてあるタイルはそのまま残し、
+        画面から出たタイルを消して、新しく見えたタイルだけ描く（全部描き直すより、ずっと軽い）"""
+        self.scroll_job = None
+        if not self.items:
+            return
+        c = self.canvas
         a, b = self.visible_range()
-        want = []
+        for i in [i for i in self.drawn if i < a or i >= b]:
+            for it in self.drawn.pop(i):
+                c.delete(it)
         for i in range(a, b):
-            v = self.items[i]
-            x = (i % self.cols) * self.TILE_W + 8
-            y = (i // self.cols) * self.TILE_H + 6
-            tw, th = self.tw, self.th
-            if v["path"] == self.selected:
-                c.create_rectangle(x - 5, y - 4, x + tw + 5, y + self.TILE_H - 8,
-                                   fill=C_ACCENT_SOFT, outline=C_ACCENT, width=2, tags="tile")
-            img = self.get_image(thumb_file(v, THUMB_SUFFIX))
-            if img:
-                c.create_image(x, y, image=img, anchor="nw", tags="tile")
-            else:
-                c.create_rectangle(x, y, x + tw, y + th, fill="#ddd", outline="", tags="tile")
-                mark = ("×" if tw < 150 else "×（絵を作れません）") if v["path"] in self.failed else "…"
-                c.create_text(x + tw / 2, y + th / 2, text=mark, fill="#777", tags="tile")
-                if v["path"] not in self.failed:
-                    want.append(v)
-            if v["key"] in self.app.stars:   # 星の動画は左上に ★
-                c.create_text(x + 4, y + 2, text="★", anchor="nw", fill="#f5b400",
-                              font=("", 12, "bold"), tags="tile")
-            dur = fmt_dur(v["dur"]) if "dur" in v else ""
-            if dur:
-                c.create_text(x + tw - 4, y + th - 4, text=dur, anchor="se",
-                              fill="white", font=("", 9, "bold"), tags="tile")
-            c.create_text(x, y + th + 4, text=v["name"], anchor="nw", width=tw,
-                          font=("", 9), tags="tile")
+            if i not in self.drawn:
+                self.drawn[i] = self.draw_tile(i)
         # タブが表示されているときだけ絵を作る（一覧タブを使っている間は何もしない＝軽い）
         if self.is_shown():
-            self.request(want)
+            self.request([v for v in self.items[a:b] if v["path"] not in self.failed
+                          and v["path"] not in self.done_paths
+                          and thumb_file(v, THUMB_SUFFIX) not in self.images])
+
+    def redraw_tiles(self, paths):
+        """中身が変わった動画のタイルだけ描き直す（見えていなければ何もしない）"""
+        for p in paths:
+            i = self.index.get(p)
+            if i in self.drawn:
+                for it in self.drawn.pop(i):
+                    self.canvas.delete(it)
+                self.drawn[i] = self.draw_tile(i)
+
+    def draw_tile(self, i):
+        c = self.canvas
+        v = self.items[i]
+        ids = []
+        x = (i % self.cols) * self.TILE_W + 8
+        y = (i // self.cols) * self.TILE_H + 6
+        tw, th = self.tw, self.th
+        if v["path"] == self.selected:
+            ids.append(c.create_rectangle(x - 5, y - 4, x + tw + 5, y + self.TILE_H - 8,
+                                          fill=C_ACCENT_SOFT, outline=C_ACCENT, width=2, tags="tile"))
+        img = self.get_image(thumb_file(v, THUMB_SUFFIX))
+        if img:
+            ids.append(c.create_image(x, y, image=img, anchor="nw", tags="tile"))
+        else:
+            ids.append(c.create_rectangle(x, y, x + tw, y + th, fill="#ddd", outline="", tags="tile"))
+            mark = ("×" if tw < 150 else "×（絵を作れません）") if v["path"] in self.failed else "…"
+            ids.append(c.create_text(x + tw / 2, y + th / 2, text=mark, fill="#777", tags="tile"))
+        if v["key"] in self.app.stars:   # 星の動画は左上に ★
+            ids.append(c.create_text(x + 4, y + 2, text="★", anchor="nw", fill="#f5b400",
+                                     font=("", 12, "bold"), tags="tile"))
+        dur = fmt_dur(v["dur"]) if "dur" in v else ""
+        if dur:
+            ids.append(c.create_text(x + tw - 4, y + th - 4, text=dur, anchor="se",
+                                     fill="white", font=("", 9, "bold"), tags="tile"))
+        ids.append(c.create_text(x, y + th + 4, text=v["name"], anchor="nw", width=tw,
+                                 font=("", 9), tags="tile"))
+        return ids
 
     # ---- 画像 ----
     def get_image(self, f):
@@ -479,7 +533,8 @@ class ThumbView(ttk.Frame):
                 if not ok:
                     self.failed.add(v["path"])
             if self.is_shown():
-                self.draw()
+                # 絵ができたタイルだけ描き直す（全部描き直すと、スクロール中に引っかかるため）
+                self.redraw_tiles([v["path"] for v, ok in done])
         if self.ffmpeg and total:
             if n_done < total:
                 self.app.thumb_status.set(f"サムネイルを作っています… {n_done} / {total}")
@@ -491,7 +546,7 @@ class ThumbView(ttk.Frame):
 
     def on_durations(self, vids):
         if self.is_shown():
-            self.draw()
+            self.redraw_tiles([v["path"] for v in vids])
         if self.selected and any(v["path"] == self.selected for v in vids):
             self.show_detail(self.selected)
 
@@ -504,11 +559,16 @@ class ThumbView(ttk.Frame):
     # ---- スクロール ----
     def on_scrollbar(self, *args):
         self.canvas.yview(*args)
-        self.draw()
+        self.schedule_scrolled()
 
     def on_wheel(self, e):
         self.canvas.yview_scroll(int(-e.delta / 120) * 2, "units")
-        self.draw()
+        self.schedule_scrolled()
+
+    def schedule_scrolled(self):
+        """ホイールを速く回すと何回も来るので、手のすいたときにまとめて 1 回だけ描く"""
+        if not self.scroll_job:
+            self.scroll_job = self.after_idle(self.draw_scrolled)
 
     # ---- 選ぶ・再生 ----
     def hit(self, e):
@@ -529,10 +589,13 @@ class ThumbView(ttk.Frame):
         if path is None or path not in self.index:
             self.draw()
             return
-        self.selected = path
+        old, self.selected = self.selected, path
         self.app.select_in_list(path)
+        top = self.canvas.canvasy(0)
         self.ensure_visible()
-        self.draw()
+        if self.canvas.canvasy(0) != top:
+            self.draw_scrolled()
+        self.redraw_tiles([p for p in (old, path) if p])   # 青い枠が動いた 2 枚だけ描き直す
         self.show_detail(path)
 
     def on_double(self, e):
@@ -659,19 +722,52 @@ def norm(s):
     return unicodedata.normalize("NFKC", s).casefold()
 
 
+def mouse_held():
+    """マウスの左ボタンを押したままか（窓のふちをつかんで大きさを変えている最中か）"""
+    try:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)
+    except Exception:
+        return False
+
+
+
 class FlowFrame(ttk.Frame):
     """中の部品を横に並べ、幅が足りなくなったら次の行へ折り返す入れ物"""
 
     def __init__(self, master, **kw):
         super().__init__(master, **kw)
-        self.bind("<Configure>", lambda e: self.relayout())
+        self.last_width = None
+        self.relayout_job = None
+        self.bind("<Configure>", self.on_configure)
+
+    def on_configure(self, e):
+        """窓の大きさを変えている間は、何十回もここに来る。
+        そのたびに折り返し直すと、下の一覧やサムネイルが上下に動いて全部描き直しになり重い。
+        幅が変わったときだけ、手が止まってから 1 回だけ折り返し直す"""
+        if e.width == self.last_width:
+            return
+        if self.relayout_job:
+            self.after_cancel(self.relayout_job)
+        self.relayout_job = self.after(150, self.relayout_when_released)
+
+    def relayout_when_released(self):
+        # 窓のふちをつかんでいる間は待つ（1 回描くのに時間がかかると、途中で折り返し直してしまうため）
+        if mouse_held():
+            self.relayout_job = self.after(150, self.relayout_when_released)
+        else:
+            self.relayout()
 
     def relayout(self):
+        if self.relayout_job:
+            self.after_cancel(self.relayout_job)
+            self.relayout_job = None
         width = self.winfo_width()
         if width <= 1:
             # 作ったばかりで幅がまだ決まっていないときは、窓の幅から見当をつける
             # （1列に縦に並んでから広がる「ガタつき」を出さないため）
             width = max(self.winfo_toplevel().winfo_width() - 120, 200)
+        else:
+            self.last_width = width
         x = y = row_h = 0
         for w in self.winfo_children():
             # 部品の「ほしい大きさ」は作った時点で分かるので、画面全体の計算はやり直さない
@@ -679,10 +775,15 @@ class FlowFrame(ttk.Frame):
             if x > 0 and x + ww > width:
                 x, y = 0, y + row_h + 2
                 row_h = 0
-            w.place(x=x, y=y)
+            # 置き場所が前と同じボタンは動かさない（動かすと画面の計算がやり直しになり重い）
+            if getattr(w, "_flow_xy", None) != (x, y):
+                w.place(x=x, y=y)
+                w._flow_xy = (x, y)
             x += ww + 4
             row_h = max(row_h, wh)
-        self.configure(height=(y + row_h) if self.winfo_children() else 1)
+        h = (y + row_h) if self.winfo_children() else 1
+        if str(h) != str(self.cget("height")):   # 高さが変わったときだけ（下の一覧が動くのはこのときだけ）
+            self.configure(height=h)
 
 
 class App:
@@ -695,7 +796,7 @@ class App:
         self.videos = []
         self.by_path = {}
         self.sorted_cache = {}
-        self.sort_key = self.settings.get("sort", "mtime")
+        self.load_sort_setting()
         self.search_job = None
         self.scan_secs = None
 
@@ -815,12 +916,17 @@ class App:
         # 列の並び（初期は 名前・タグ・長さ…）。並べ替えた順は保存して次回も使う
         self.tree.configure(displaycolumns=self.column_order())
         self.col_drag = None
-        self.tree.heading("name", command=lambda: self.set_sort("name"))
-        self.tree.heading("mtime", command=lambda: self.set_sort("mtime"))
+        self.heads = heads
+        # どの列も、見出しを押すとその列で並べ替え。同じ見出しをもう一度押すと逆の順
+        for c in SORT_COLUMNS:
+            self.tree.heading(c, command=lambda c=c: self.click_sort(c))
         sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+        self.tree.bind("<MouseWheel>", self.on_tree_wheel)
+        self.wheel_acc = 0.0
+        self.wheel_job = None
         self.tree.bind("<Double-1>", self.on_double_click)
         self.tree.bind("<ButtonPress-1>", self.on_col_press, add="+")
         self.tree.bind("<B1-Motion>", self.on_col_motion, add="+")
@@ -975,6 +1081,7 @@ class App:
             if self.tree.exists(v["path"]):
                 self.tree.set(v["path"], "dur", fmt_dur(v["dur"]))
         if done:
+            self.forget_sort("dur")
             self.thumb_view.on_durations(done)
         self.dur_done += len(done)
         self.dur_unsaved += len(done)
@@ -1064,6 +1171,7 @@ class App:
         self.stars = set(self.settings.get("stars", []))
         self.star_only = False
         self.tags = data.get("tags", {}) if isinstance(data.get("tags"), dict) else {}
+        self.forget_sort("tags", "star")
         save_settings(self.settings)
         save_tags(self.tags)
         self.apply_settings_to_screen()
@@ -1071,7 +1179,7 @@ class App:
 
     def apply_settings_to_screen(self):
         """読み込んだ設定を、画面にすべて反映する"""
-        self.sort_key = self.settings.get("sort", "mtime")
+        self.load_sort_setting()
         self.active_tag = None
         self.update_player_box()
         self.draw_favorites()
@@ -1082,6 +1190,21 @@ class App:
                 self.tree.column(c, width=int(w))
         self.tree.configure(displaycolumns=self.column_order())
         self.rescan()   # フォルダが変わっているかもしれないので読み込み直す（タグも反映される）
+
+    def on_tree_wheel(self, e):
+        """一覧のホイール。tkinter の元のままだと 1 目盛り 1 行で、そのたびに一覧全体を描き直すので重い。
+        エクスプローラーと同じ 1 目盛り 3 行にし、速く回したぶんは、まとめて 1 回で動かす"""
+        self.wheel_acc += -e.delta / 120 * 3
+        if not self.wheel_job:
+            self.wheel_job = self.root.after_idle(self.apply_tree_wheel)
+        return "break"
+
+    def apply_tree_wheel(self):
+        self.wheel_job = None
+        n = int(self.wheel_acc)
+        self.wheel_acc -= n
+        if n:
+            self.tree.yview_scroll(n, "units")
 
     def column_order(self):
         """列の並び。再生ボタンの列は、いつも左端に置く"""
@@ -1173,21 +1296,66 @@ class App:
         v["search"] = v["base"] + ("\n" + norm(" ".join(tags)) if tags else "")
 
     # ---- 並べ替え・検索・表示 ----
-    def set_sort(self, key):
+    def load_sort_setting(self):
+        key = self.settings.get("sort", "mtime")
+        self.sort_key = key if key in SORT_COLUMNS else "mtime"
+        # 前の版の設定には向きが無いので、その列のふだんの向きにする
+        self.sort_desc = bool(self.settings.get("sort_desc", self.sort_key in SORT_DESC_FIRST))
+
+    def set_sort(self, key, desc=None):
+        """新着順・名前順のボタンや見出しから呼ぶ。desc を省くと、その列のふだんの向き"""
         self.sort_key = key
+        self.sort_desc = key in SORT_DESC_FIRST if desc is None else desc
         self.settings["sort"] = key
+        self.settings["sort_desc"] = self.sort_desc
         save_settings(self.settings)
         self.refresh()
 
+    def click_sort(self, col):
+        """見出しを押したとき。今と同じ列なら逆の順、違う列ならその列のふだんの向き"""
+        if col == self.sort_key:
+            self.set_sort(col, not self.sort_desc)
+        else:
+            self.set_sort(col)
+
+    def forget_sort(self, *cols):
+        """長さ・タグ・星が変わったら、その列で並べた結果を作り直す（次に並べるときに反映）"""
+        for k in list(self.sorted_cache):
+            if k[0] in cols:
+                del self.sorted_cache[k]
+
     def sorted_videos(self):
-        """並べ替えた結果は覚えておき、検索のたびに並べ替え直さない"""
-        if self.sort_key not in self.sorted_cache:
-            if self.sort_key == "name":
-                items = sorted(self.videos, key=lambda v: norm(v["name"]))
-            else:
-                items = sorted(self.videos, key=lambda v: v["mtime"], reverse=True)
-            self.sorted_cache[self.sort_key] = items
-        return self.sorted_cache[self.sort_key]
+        """並べ替えた結果は覚えておき、検索のたびに並べ替え直さない。
+        同じ値どうしは新しい順。長さ・タグが無い動画は、向きに関係なくいちばん下"""
+        ck = (self.sort_key, self.sort_desc)
+        if ck in self.sorted_cache:
+            return self.sorted_cache[ck]
+        key, desc = ck
+        base = sorted(self.videos, key=lambda v: v["mtime"], reverse=True)
+        if key == "mtime":
+            items = base if desc else base[::-1]
+        else:
+            tags, stars = self.tags, self.stars
+            if key == "name":
+                have, none, f = base, [], lambda v: norm(v["name"])
+            elif key == "folder":
+                have, none, f = base, [], lambda v: (norm(v["folder"]), norm(v["name"]))
+            elif key == "size":
+                have, none, f = base, [], lambda v: v["size"]
+            elif key == "star":
+                have, none, f = base, [], lambda v: v["key"] in stars
+            elif key == "dur":
+                have = [v for v in base if isinstance(v.get("dur"), (int, float))]
+                none = [v for v in base if not isinstance(v.get("dur"), (int, float))]
+                f = lambda v: v["dur"]
+            else:   # tags
+                have = [v for v in base if tags.get(v["key"])]
+                none = [v for v in base if not tags.get(v["key"])]
+                f = lambda v: norm("、".join(tags[v["key"]]))
+            # Python の並べ替えは、逆の順でも同じ値どうしの順（＝新しい順）を保つ
+            items = sorted(have, key=f, reverse=desc) + none
+        self.sorted_cache[ck] = items
+        return items
 
     def schedule_search(self):
         """文字を打つたびに探すと重いので、打つ手が 0.15 秒止まったら探す"""
@@ -1220,10 +1388,15 @@ class App:
         secs = time.perf_counter() - t0
         self.thumb_view.set_items(items)
 
-        self.btn_mtime.state(["pressed"] if self.sort_key == "mtime" else ["!pressed"])
-        self.btn_name.state(["pressed"] if self.sort_key == "name" else ["!pressed"])
-        self.tree.heading("mtime", text="更新日 ▼" if self.sort_key == "mtime" else "更新日")
-        self.tree.heading("name", text="名前 ▲" if self.sort_key == "name" else "名前")
+        self.btn_mtime.state(["pressed"] if (self.sort_key, self.sort_desc) == ("mtime", True) else ["!pressed"])
+        self.btn_name.state(["pressed"] if (self.sort_key, self.sort_desc) == ("name", False) else ["!pressed"])
+        # 並べている列の見出しに ▲（小さい・古い・あ→ん）か ▼（大きい・新しい）を付ける
+        for c in SORT_COLUMNS:
+            if c == "star":   # 星の列は細いので、印だけ変える
+                text = ("★▼" if self.sort_desc else "★▲") if c == self.sort_key else "☆"
+            else:
+                text = self.heads[c] + ((" ▼" if self.sort_desc else " ▲") if c == self.sort_key else "")
+            self.tree.heading(c, text=text)
 
         if words or tag or self.star_only:
             msg = f"{len(items)} 本（全 {len(self.videos)} 本中）  ／  表示 {secs:.2f} 秒"
@@ -1261,6 +1434,7 @@ class App:
             (self.stars.add if add else self.stars.discard)(v["key"])
         self.settings["stars"] = sorted(self.stars)
         save_settings(self.settings)
+        self.forget_sort("star")
         self.update_star_button()
         if self.star_only and not add:
             self.refresh()   # 星だけの一覧から外れた動画を消す
@@ -1335,6 +1509,7 @@ class App:
         else:
             self.tags.pop(v["key"], None)
         self.update_search_text(v)
+        self.forget_sort("tags")
 
     def after_tag_change(self, paths):
         save_tags(self.tags)
@@ -1365,6 +1540,7 @@ class App:
                     del self.tags[k]
         for v in self.videos:
             self.update_search_text(v)
+        self.forget_sort("tags")
         if self.active_tag == tag:
             self.active_tag = None
         save_tags(self.tags)
@@ -1893,6 +2069,22 @@ class App:
         save_settings(self.settings)
         self.draw_favorites()
 
+    def sort_favorites(self, names, how):
+        """分類の中のボタンを並べ直す（1回だけ。あとからドラッグで動かすこともできる）"""
+        counts = {}
+        for name in names:
+            g = self.group(name)
+            if how == "count":
+                for w in g["words"]:
+                    if w not in counts:
+                        counts[w] = self.fav_count(w)
+                # 本数の多い順。同じ本数なら名前順
+                g["words"].sort(key=lambda w: (-counts[w], norm(w)))
+            else:
+                g["words"].sort(key=norm)
+        save_settings(self.settings)
+        self.draw_favorites()
+
     def group_menu(self, name, event):
         gs = self.groups()
         i = gs.index(self.group(name))
@@ -1901,6 +2093,16 @@ class App:
                          state="normal" if i > 0 else "disabled")
         menu.add_command(label="▼ 下へ", command=lambda: self.move_group(name, 1),
                          state="normal" if i < len(gs) - 1 else "disabled")
+        menu.add_separator()
+        has = len(self.group(name)["words"]) > 1
+        menu.add_command(label="この分類を名前順に並べる", command=lambda: self.sort_favorites([name], "name"),
+                         state="normal" if has else "disabled")
+        menu.add_command(label="この分類を本数の多い順に並べる", command=lambda: self.sort_favorites([name], "count"),
+                         state="normal" if has else "disabled")
+        menu.add_command(label="全部の分類を名前順に並べる",
+                         command=lambda: self.sort_favorites([g["name"] for g in gs], "name"))
+        menu.add_command(label="全部の分類を本数の多い順に並べる",
+                         command=lambda: self.sort_favorites([g["name"] for g in gs], "count"))
         menu.add_separator()
         menu.add_command(label="名前を変える…", command=lambda: self.rename_group(name))
         menu.add_command(label="この分類を消す…", command=lambda: self.delete_group(name),
